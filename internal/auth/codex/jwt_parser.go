@@ -100,3 +100,23 @@ func (c *JWTClaims) GetUserEmail() string {
 func (c *JWTClaims) GetAccountID() string {
 	return c.CodexAuthInfo.ChatgptAccountID
 }
+
+// GetOrganizations returns the organization/workspace entries embedded in the ID token.
+func (c *JWTClaims) GetOrganizations() []Organizations {
+	if c == nil {
+		return nil
+	}
+	out := make([]Organizations, 0, len(c.CodexAuthInfo.Organizations))
+	for _, org := range c.CodexAuthInfo.Organizations {
+		if strings.TrimSpace(org.ID) == "" {
+			continue
+		}
+		out = append(out, Organizations{
+			ID:        strings.TrimSpace(org.ID),
+			IsDefault: org.IsDefault,
+			Role:      strings.TrimSpace(org.Role),
+			Title:     strings.TrimSpace(org.Title),
+		})
+	}
+	return out
+}

@@ -94,6 +94,9 @@ type Config struct {
 	// These are used only when the client does not send its own headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
 
+	// CodexTeam configures experimental handling for Codex team accounts.
+	CodexTeam CodexTeamConfig `yaml:"codex-team" json:"codex-team"`
+
 	// ClaudeKey defines a list of Claude API key configurations as specified in the YAML configuration file.
 	ClaudeKey []ClaudeKey `yaml:"claude-api-key" json:"claude-api-key"`
 
@@ -149,6 +152,13 @@ type ClaudeHeaderDefaults struct {
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+}
+
+// CodexTeamConfig configures experimental team/workspace handling for Codex OAuth accounts.
+type CodexTeamConfig struct {
+	// ExperimentalWorkspaceRouting enables runtime-only virtual auth creation for
+	// team organizations/workspaces discovered from the Codex ID token.
+	ExperimentalWorkspaceRouting bool `yaml:"experimental-workspace-routing" json:"experimental-workspace-routing"`
 }
 
 // TLSConfig holds HTTPS server settings.

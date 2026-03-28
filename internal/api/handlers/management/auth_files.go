@@ -258,6 +258,27 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	c.JSON(200, gin.H{"files": files})
 }
 
+func (h *Handler) ListAuthFileWorkspaceQuota(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	auths := h.authManager.List()
+	teams := buildCodexWorkspaceQuotaView(auths, h)
+	c.JSON(http.StatusOK, gin.H{
+		"teams": teams,
+		"meta": gin.H{
+			"workspace_routing_enabled": h.cfg != nil && h.cfg.CodexTeam.ExperimentalWorkspaceRouting,
+			"quota_mode":                "availability",
+		},
+	})
+}
+
 // GetAuthFileModels returns the models supported by a specific auth file
 func (h *Handler) GetAuthFileModels(c *gin.Context) {
 	name := c.Query("name")
@@ -347,6 +368,11 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 						fileData["note"] = trimmed
 					}
 				}
+				accountSource := strings.ToLower(strings.TrimSpace(gjson.GetBytes(data, "account_source").String()))
+				if accountSource == "" {
+					accountSource = coreauth.AccountSourceOwned
+				}
+				fileData["account_source"] = accountSource
 			}
 
 			files = append(files, fileData)
@@ -386,6 +412,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"runtime_only":   runtimeOnly,
 		"source":         "memory",
 		"size":           int64(0),
+		"account_source": auth.AccountSource(),
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
@@ -429,6 +456,59 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
+		if organizations, ok := claims["organizations"]; ok {
+			entry["workspaces"] = organizations
+		}
+		if planType, ok := claims["plan_type"]; ok {
+			entry["plan_type"] = planType
+		}
+		if accountID, ok := claims["chatgpt_account_id"]; ok {
+			entry["chatgpt_account_id"] = accountID
+		}
+		if _, hasRouting := entry["routing_status"]; !hasRouting {
+			if h != nil && h.cfg != nil && h.cfg.CodexTeam.ExperimentalWorkspaceRouting {
+				entry["routing_status"] = "experimental_routing_enabled"
+			} else {
+				entry["routing_status"] = "display_only"
+			}
+		}
+	}
+	if auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["routing_status"]); v != "" {
+			entry["routing_status"] = v
+		}
+		if v := strings.TrimSpace(auth.Attributes["codex_workspace_id"]); v != "" {
+			entry["workspace_id"] = v
+		}
+		if v := strings.TrimSpace(auth.Attributes["codex_workspace_title"]); v != "" {
+			entry["workspace_title"] = v
+		}
+		if v := strings.TrimSpace(auth.Attributes["codex_workspace_role"]); v != "" {
+			entry["workspace_role"] = v
+		}
+		if v := strings.TrimSpace(auth.Attributes["codex_workspace_default"]); v != "" {
+			entry["workspace_default"] = strings.EqualFold(v, "true")
+		}
+		if v := strings.TrimSpace(auth.Attributes["codex_virtual_parent"]); v != "" {
+			entry["workspace_parent_id"] = v
+		}
+		if v := strings.TrimSpace(auth.Attributes["codex_virtual_primary"]); v != "" {
+			entry["workspace_primary"] = strings.EqualFold(v, "true")
+		}
+		if v := strings.TrimSpace(auth.Attributes["virtual_children"]); v != "" {
+			entry["workspace_children"] = strings.Split(v, ",")
+		}
+	}
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["workspace_id"].(string); ok && strings.TrimSpace(v) != "" {
+			entry["workspace_id"] = strings.TrimSpace(v)
+		}
+		if v, ok := auth.Metadata["workspace_title"].(string); ok && strings.TrimSpace(v) != "" {
+			entry["workspace_title"] = strings.TrimSpace(v)
+		}
+		if v, ok := auth.Metadata["workspace_role"].(string); ok && strings.TrimSpace(v) != "" {
+			entry["workspace_role"] = strings.TrimSpace(v)
+		}
 	}
 	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
@@ -497,11 +577,487 @@ func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
 	if v := claims.CodexAuthInfo.ChatgptSubscriptionActiveUntil; v != nil {
 		result["chatgpt_subscription_active_until"] = v
 	}
+	if orgs := claims.GetOrganizations(); len(orgs) > 0 {
+		items := make([]gin.H, 0, len(orgs))
+		for _, org := range orgs {
+			items = append(items, gin.H{
+				"id":         org.ID,
+				"title":      org.Title,
+				"role":       org.Role,
+				"is_default": org.IsDefault,
+			})
+		}
+		result["organizations"] = items
+	}
 
 	if len(result) == 0 {
 		return nil
 	}
 	return result
+}
+
+func buildCodexWorkspaceQuotaView(auths []*coreauth.Auth, h *Handler) []gin.H {
+	type workspaceAggregate struct {
+		ID        string
+		Title     string
+		Role      string
+		IsDefault bool
+		Auth      *coreauth.Auth
+		PlanType  string
+		AccountID string
+		Source    string
+	}
+	type teamAggregate struct {
+		ID             string
+		Email          string
+		Parent         *coreauth.Auth
+		PlanType       string
+		RoutingStatus  string
+		HasTeamPlan    bool
+		Workspaces     map[string]*workspaceAggregate
+		WorkspaceOrder []string
+		AccountIDs     map[string]struct{}
+		AccountIDOrder []string
+	}
+
+	getOrCreateTeam := func(teams map[string]*teamAggregate, id string) *teamAggregate {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return nil
+		}
+		existing := teams[id]
+		if existing != nil {
+			return existing
+		}
+		existing = &teamAggregate{
+			ID:             id,
+			Workspaces:     make(map[string]*workspaceAggregate),
+			WorkspaceOrder: make([]string, 0, 4),
+			AccountIDs:     make(map[string]struct{}),
+			AccountIDOrder: make([]string, 0, 4),
+		}
+		teams[id] = existing
+		return existing
+	}
+
+	addAccountID := func(team *teamAggregate, accountID string) {
+		if team == nil {
+			return
+		}
+		accountID = strings.TrimSpace(accountID)
+		if accountID == "" {
+			return
+		}
+		if _, exists := team.AccountIDs[accountID]; exists {
+			return
+		}
+		team.AccountIDs[accountID] = struct{}{}
+		team.AccountIDOrder = append(team.AccountIDOrder, accountID)
+	}
+
+	ensureWorkspace := func(team *teamAggregate, id string) *workspaceAggregate {
+		if team == nil {
+			return nil
+		}
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return nil
+		}
+		ws := team.Workspaces[id]
+		if ws != nil {
+			return ws
+		}
+		ws = &workspaceAggregate{ID: id}
+		team.Workspaces[id] = ws
+		team.WorkspaceOrder = append(team.WorkspaceOrder, id)
+		return ws
+	}
+
+	deriveWorkspaceTitle := func(planType, rawTitle string) string {
+		title := strings.TrimSpace(rawTitle)
+		switch {
+		case title != "" && !strings.EqualFold(title, "personal"):
+			return title
+		case strings.EqualFold(planType, "team"):
+			return "Team Account"
+		case strings.EqualFold(planType, "free"):
+			return "Personal Account"
+		case title != "":
+			return title
+		default:
+			return "Codex Account"
+		}
+	}
+
+	teams := make(map[string]*teamAggregate)
+	for _, auth := range auths {
+		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			continue
+		}
+
+		claims := extractCodexIDTokenClaims(auth)
+		planType := strings.TrimSpace(authAttribute(auth, "plan_type"))
+		if planType == "" {
+			if raw, ok := claims["plan_type"].(string); ok {
+				planType = strings.TrimSpace(raw)
+			}
+		}
+		accountID := strings.TrimSpace(authAttribute(auth, "chatgpt_account_id"))
+		if accountID == "" {
+			if raw, ok := claims["chatgpt_account_id"].(string); ok {
+				accountID = strings.TrimSpace(raw)
+			}
+		}
+		if accountID == "" {
+			if raw, ok := auth.Metadata["account_id"].(string); ok {
+				accountID = strings.TrimSpace(raw)
+			}
+		}
+
+		groupEmail := strings.ToLower(strings.TrimSpace(authEmail(auth)))
+		if groupEmail == "" {
+			groupEmail = strings.ToLower(strings.TrimSpace(accountDisplay(auth)))
+		}
+		groupID := groupEmail
+		if groupID == "" {
+			groupID = strings.TrimSpace(authAttribute(auth, "codex_virtual_parent"))
+		}
+		if groupID == "" {
+			groupID = firstNonEmpty(accountID, strings.TrimSpace(auth.ID))
+		}
+
+		team := getOrCreateTeam(teams, groupID)
+		if team == nil {
+			continue
+		}
+		if team.Email == "" && groupEmail != "" {
+			team.Email = groupEmail
+		}
+		if strings.EqualFold(planType, "team") {
+			team.HasTeamPlan = true
+		}
+
+		if team.PlanType == "" || strings.EqualFold(planType, "team") {
+			team.PlanType = planType
+		}
+		addAccountID(team, accountID)
+
+		if strings.TrimSpace(authAttribute(auth, "codex_virtual_parent")) == "" && (team.Parent == nil || strings.EqualFold(planType, "team")) {
+			team.Parent = auth
+		}
+
+		var claimOrganizations []gin.H
+		if claims != nil {
+			if organizations, ok := claims["organizations"].([]gin.H); ok {
+				claimOrganizations = organizations
+				if len(organizations) > 1 {
+					for _, org := range organizations {
+						id, _ := org["id"].(string)
+						ws := ensureWorkspace(team, id)
+						if ws == nil {
+							continue
+						}
+						if title, ok := org["title"].(string); ok && strings.TrimSpace(title) != "" {
+							ws.Title = deriveWorkspaceTitle(planType, title)
+						}
+						if role, ok := org["role"].(string); ok && strings.TrimSpace(role) != "" {
+							ws.Role = strings.TrimSpace(role)
+						}
+						if isDefault, ok := org["is_default"].(bool); ok {
+							ws.IsDefault = isDefault
+						}
+						if ws.PlanType == "" {
+							ws.PlanType = planType
+						}
+						if ws.AccountID == "" {
+							ws.AccountID = accountID
+						}
+						if ws.Source == "" {
+							ws.Source = "id_token_organization"
+						}
+					}
+				}
+			}
+		}
+
+		workspaceID := strings.TrimSpace(authAttribute(auth, "codex_workspace_id"))
+		if workspaceID == "" {
+			if v, ok := auth.Metadata["workspace_id"].(string); ok {
+				workspaceID = strings.TrimSpace(v)
+			}
+		}
+		if workspaceID != "" {
+			ws := ensureWorkspace(team, workspaceID)
+			if ws == nil {
+				continue
+			}
+			if title := strings.TrimSpace(authAttribute(auth, "codex_workspace_title")); title != "" {
+				ws.Title = deriveWorkspaceTitle(planType, title)
+			} else if v, ok := auth.Metadata["workspace_title"].(string); ok && strings.TrimSpace(v) != "" {
+				ws.Title = deriveWorkspaceTitle(planType, v)
+			}
+			if role := strings.TrimSpace(authAttribute(auth, "codex_workspace_role")); role != "" {
+				ws.Role = role
+			} else if v, ok := auth.Metadata["workspace_role"].(string); ok && strings.TrimSpace(v) != "" {
+				ws.Role = strings.TrimSpace(v)
+			}
+			if rawDefault := strings.TrimSpace(authAttribute(auth, "codex_workspace_default")); rawDefault != "" {
+				ws.IsDefault = strings.EqualFold(rawDefault, "true")
+			}
+			ws.PlanType = firstNonEmpty(ws.PlanType, planType)
+			ws.AccountID = firstNonEmpty(ws.AccountID, accountID)
+			ws.Source = firstNonEmpty(ws.Source, "runtime_workspace")
+			if ws.Auth == nil || isRuntimeOnlyAuth(auth) {
+				ws.Auth = auth
+			}
+		} else if strings.TrimSpace(authAttribute(auth, "codex_virtual_parent")) == "" {
+			fallbackID := firstNonEmpty(accountID, strings.TrimSpace(auth.ID))
+			ws := ensureWorkspace(team, fallbackID)
+			if ws == nil {
+				continue
+			}
+			title := ""
+			role := ""
+			isDefault := false
+			if len(claimOrganizations) > 0 {
+				if raw, ok := claimOrganizations[0]["title"].(string); ok {
+					title = raw
+				}
+				if raw, ok := claimOrganizations[0]["role"].(string); ok {
+					role = strings.TrimSpace(raw)
+				}
+				if raw, ok := claimOrganizations[0]["is_default"].(bool); ok {
+					isDefault = raw
+				}
+			}
+			if ws.Title == "" {
+				ws.Title = deriveWorkspaceTitle(planType, title)
+			}
+			if ws.Role == "" {
+				ws.Role = role
+			}
+			if !ws.IsDefault {
+				ws.IsDefault = isDefault
+			}
+			ws.PlanType = firstNonEmpty(ws.PlanType, planType)
+			ws.AccountID = firstNonEmpty(ws.AccountID, accountID)
+			ws.Source = firstNonEmpty(ws.Source, "auth_file_fallback")
+			if ws.Auth == nil {
+				ws.Auth = auth
+			}
+		}
+
+		routingStatus := strings.TrimSpace(authAttribute(auth, "routing_status"))
+		if routingStatus == "" {
+			if h != nil && h.cfg != nil && h.cfg.CodexTeam.ExperimentalWorkspaceRouting && strings.EqualFold(planType, "team") {
+				routingStatus = "routing_verified"
+			} else {
+				routingStatus = "display_only"
+			}
+		}
+		if team.RoutingStatus == "" || routingStatus == "routing_verified" {
+			team.RoutingStatus = routingStatus
+		}
+	}
+
+	teamIDs := make([]string, 0, len(teams))
+	for id := range teams {
+		teamIDs = append(teamIDs, id)
+	}
+	sort.Strings(teamIDs)
+
+	out := make([]gin.H, 0, len(teamIDs))
+	for _, teamID := range teamIDs {
+		team := teams[teamID]
+		if team == nil || !team.HasTeamPlan {
+			continue
+		}
+		sort.Strings(team.WorkspaceOrder)
+		parentAuth := team.Parent
+		if parentAuth == nil {
+			for _, workspaceID := range team.WorkspaceOrder {
+				ws := team.Workspaces[workspaceID]
+				if ws != nil && ws.Auth != nil {
+					parentAuth = ws.Auth
+					break
+				}
+			}
+		}
+		if parentAuth == nil {
+			continue
+		}
+
+		workspaceRows := make([]gin.H, 0, len(team.WorkspaceOrder))
+		availableCount := 0
+		routingCandidateCount := 0
+		for _, workspaceID := range team.WorkspaceOrder {
+			ws := team.Workspaces[workspaceID]
+			if ws == nil {
+				continue
+			}
+			runtimeAuth := ws.Auth
+			displayAuth := runtimeAuth
+			if displayAuth == nil {
+				displayAuth = parentAuth
+			}
+			routingStatus := "display_only"
+			if runtimeAuth != nil {
+				routingStatus = strings.TrimSpace(authAttribute(runtimeAuth, "routing_status"))
+			}
+			if routingStatus == "" {
+				if runtimeAuth != nil {
+					routingStatus = "routing_verified"
+				} else if h != nil && h.cfg != nil && h.cfg.CodexTeam.ExperimentalWorkspaceRouting && len(team.WorkspaceOrder) == 1 {
+					routingStatus = "routing_verified"
+				}
+			}
+			if routingStatus == "" {
+				routingStatus = "display_only"
+			}
+			isRoutingCandidate := false
+			if runtimeAuth != nil {
+				isRoutingCandidate = !runtimeAuth.Disabled && runtimeAuth.Status != coreauth.StatusDisabled
+			} else if len(team.WorkspaceOrder) == 1 && h != nil && h.cfg != nil && h.cfg.CodexTeam.ExperimentalWorkspaceRouting {
+				isRoutingCandidate = true
+			}
+
+			quotaView := authAvailabilityView(displayAuth)
+			if status, _ := quotaView["status"].(string); status == "available" {
+				availableCount++
+			}
+			if isRoutingCandidate {
+				routingCandidateCount++
+			}
+
+			row := gin.H{
+				"workspace_id":         ws.ID,
+				"title":                firstNonEmpty(ws.Title, ws.ID),
+				"role":                 ws.Role,
+				"is_default":           ws.IsDefault,
+				"plan_type":            ws.PlanType,
+				"chatgpt_account_id":   ws.AccountID,
+				"source":               ws.Source,
+				"routing_status":       routingStatus,
+				"is_routing_candidate": isRoutingCandidate,
+				"quota_view":           quotaView,
+				"model_states":         summarizeModelStates(displayAuth),
+			}
+			workspaceRows = append(workspaceRows, row)
+		}
+
+		teamRow := gin.H{
+			"team_id":                   team.ID,
+			"provider":                  "codex",
+			"plan_type":                 firstNonEmpty(team.PlanType, "team"),
+			"routing_status":            firstNonEmpty(team.RoutingStatus, "display_only"),
+			"email":                     firstNonEmpty(team.Email, authEmail(parentAuth)),
+			"account":                   accountDisplay(parentAuth),
+			"chatgpt_account_id":        firstNonEmpty(firstNonEmpty(team.AccountIDOrder...), ""),
+			"chatgpt_account_ids":       append([]string(nil), team.AccountIDOrder...),
+			"account_count":             len(team.AccountIDOrder),
+			"workspace_count":           len(workspaceRows),
+			"routing_candidate_count":   routingCandidateCount,
+			"available_workspace_count": availableCount,
+			"team_quota_view":           authAvailabilityView(parentAuth),
+			"workspaces":                workspaceRows,
+		}
+		out = append(out, teamRow)
+	}
+
+	return out
+}
+
+func authAvailabilityView(auth *coreauth.Auth) gin.H {
+	view := gin.H{
+		"status": "available",
+	}
+	if auth == nil {
+		view["status"] = "unknown"
+		return view
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		view["status"] = "disabled"
+	} else if auth.Quota.Exceeded {
+		view["status"] = "cooling"
+	} else if auth.Unavailable {
+		view["status"] = "unavailable"
+	}
+	if auth.StatusMessage != "" {
+		view["status_message"] = auth.StatusMessage
+	}
+	if auth.Quota.Reason != "" {
+		view["reason"] = auth.Quota.Reason
+	}
+	if !auth.Quota.NextRecoverAt.IsZero() {
+		view["next_recover_at"] = auth.Quota.NextRecoverAt
+	}
+	if auth.Quota.BackoffLevel > 0 {
+		view["backoff_level"] = auth.Quota.BackoffLevel
+	}
+	if !auth.NextRetryAfter.IsZero() {
+		view["next_retry_after"] = auth.NextRetryAfter
+	}
+	view["unavailable"] = auth.Unavailable
+	view["disabled"] = auth.Disabled || auth.Status == coreauth.StatusDisabled
+	return view
+}
+
+func summarizeModelStates(auth *coreauth.Auth) []gin.H {
+	if auth == nil || len(auth.ModelStates) == 0 {
+		return nil
+	}
+	models := make([]string, 0, len(auth.ModelStates))
+	for model := range auth.ModelStates {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	out := make([]gin.H, 0, len(models))
+	for _, model := range models {
+		state := auth.ModelStates[model]
+		if state == nil {
+			continue
+		}
+		row := gin.H{
+			"model":       model,
+			"status":      state.Status,
+			"unavailable": state.Unavailable,
+		}
+		if state.StatusMessage != "" {
+			row["status_message"] = state.StatusMessage
+		}
+		if state.Quota.Exceeded {
+			row["quota_status"] = "cooling"
+		} else if state.Unavailable {
+			row["quota_status"] = "unavailable"
+		} else {
+			row["quota_status"] = "available"
+		}
+		if state.Quota.Reason != "" {
+			row["reason"] = state.Quota.Reason
+		}
+		if !state.Quota.NextRecoverAt.IsZero() {
+			row["next_recover_at"] = state.Quota.NextRecoverAt
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func accountDisplay(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	_, account := auth.AccountInfo()
+	return strings.TrimSpace(account)
 }
 
 func authEmail(auth *coreauth.Auth) string {
@@ -900,7 +1456,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
-// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority, note) of an auth file.
+// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority, note, account_source) of an auth file.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -908,11 +1464,12 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string  `json:"name"`
-		Prefix   *string `json:"prefix"`
-		ProxyURL *string `json:"proxy_url"`
-		Priority *int    `json:"priority"`
-		Note     *string `json:"note"`
+		Name          string  `json:"name"`
+		Prefix        *string `json:"prefix"`
+		ProxyURL      *string `json:"proxy_url"`
+		Priority      *int    `json:"priority"`
+		Note          *string `json:"note"`
+		AccountSource *string `json:"account_source"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -984,6 +1541,13 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		}
 		changed = true
 	}
+	if req.AccountSource != nil {
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		targetAuth.SetAccountSource(*req.AccountSource)
+		changed = true
+	}
 
 	if !changed {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
@@ -998,6 +1562,245 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+type authInspectionRow struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Provider      string `json:"provider"`
+	Label         string `json:"label,omitempty"`
+	Email         string `json:"email,omitempty"`
+	AccountSource string `json:"account_source"`
+	Status        string `json:"status,omitempty"`
+	StatusMessage string `json:"status_message,omitempty"`
+	Disabled      bool   `json:"disabled"`
+	Outcome       string `json:"outcome"`
+	Reason        string `json:"reason,omitempty"`
+	HTTPStatus    int    `json:"http_status,omitempty"`
+}
+
+func (h *Handler) InspectBatchAuthFiles(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	auths := h.authManager.List()
+	results := make([]authInspectionRow, 0)
+	for _, auth := range auths {
+		if auth == nil || auth.AccountSource() != coreauth.AccountSourceBatch {
+			continue
+		}
+		if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+			continue
+		}
+		row := h.inspectAuth(c.Request.Context(), auth)
+		results = append(results, row)
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Outcome != results[j].Outcome {
+			return results[i].Outcome < results[j].Outcome
+		}
+		return strings.ToLower(results[i].Name) < strings.ToLower(results[j].Name)
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"results": results,
+		"summary": gin.H{
+			"total":     len(results),
+			"invalid":   countInspectionRows(results, "invalid"),
+			"uncertain": countInspectionRows(results, "uncertain"),
+			"healthy":   countInspectionRows(results, "healthy"),
+		},
+	})
+}
+
+func countInspectionRows(rows []authInspectionRow, outcome string) int {
+	total := 0
+	for _, row := range rows {
+		if row.Outcome == outcome {
+			total++
+		}
+	}
+	return total
+}
+
+func (h *Handler) inspectAuth(ctx context.Context, auth *coreauth.Auth) authInspectionRow {
+	row := authInspectionRow{
+		ID:            auth.ID,
+		Name:          firstNonEmpty(strings.TrimSpace(auth.FileName), strings.TrimSpace(auth.ID)),
+		Provider:      strings.TrimSpace(auth.Provider),
+		Label:         strings.TrimSpace(auth.Label),
+		AccountSource: auth.AccountSource(),
+		Status:        string(auth.Status),
+		StatusMessage: strings.TrimSpace(auth.StatusMessage),
+		Disabled:      auth.Disabled || auth.Status == coreauth.StatusDisabled,
+	}
+	if email := authEmail(auth); email != "" {
+		row.Email = email
+	}
+
+	if invalid, reason, httpStatus := invalidFromExistingState(auth); invalid {
+		row.Outcome = "invalid"
+		row.Reason = reason
+		row.HTTPStatus = httpStatus
+		return row
+	}
+
+	executor, ok := h.authManager.Executor(auth.Provider)
+	if !ok || executor == nil {
+		row.Outcome = "uncertain"
+		row.Reason = "executor unavailable"
+		return row
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	updated, err := executor.Refresh(probeCtx, auth.Clone())
+	if err == nil {
+		row.Outcome = "healthy"
+		row.Reason = "refresh ok"
+		if updated != nil {
+			if email := authEmail(updated); email != "" {
+				row.Email = email
+			}
+		}
+		return row
+	}
+
+	httpStatus := statusCodeFromProbeError(err)
+	row.HTTPStatus = httpStatus
+	switch httpStatus {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusPaymentRequired:
+		row.Outcome = "invalid"
+		row.Reason = firstNonEmpty(strings.TrimSpace(err.Error()), "refresh unauthorized")
+	case http.StatusTooManyRequests:
+		row.Outcome = "uncertain"
+		row.Reason = "refresh rate limited"
+	default:
+		row.Outcome = "uncertain"
+		row.Reason = firstNonEmpty(strings.TrimSpace(err.Error()), "refresh failed")
+	}
+	return row
+}
+
+func invalidFromExistingState(auth *coreauth.Auth) (bool, string, int) {
+	if auth == nil {
+		return false, "", 0
+	}
+	if auth.LastError != nil {
+		switch auth.LastError.HTTPStatus {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusPaymentRequired:
+			return true, firstNonEmpty(strings.TrimSpace(auth.StatusMessage), strings.TrimSpace(auth.LastError.Message), "unauthorized"), auth.LastError.HTTPStatus
+		}
+	}
+	msg := strings.ToLower(strings.TrimSpace(auth.StatusMessage))
+	switch msg {
+	case "unauthorized", "payment_required":
+		return true, msg, 0
+	}
+	return false, "", 0
+}
+
+func statusCodeFromProbeError(err error) int {
+	if err == nil {
+		return 0
+	}
+	type statusCoder interface {
+		StatusCode() int
+	}
+	var sc statusCoder
+	if errors.As(err, &sc) {
+		return sc.StatusCode()
+	}
+	return 0
+}
+
+func (h *Handler) CleanupBatchAuthFiles(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		IDs  []string `json:"ids"`
+		Mode string   `json:"mode"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode != "disable" && mode != "delete" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "mode must be disable or delete"})
+		return
+	}
+	if len(req.IDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ids is required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	processed := make([]string, 0, len(req.IDs))
+	skipped := make([]gin.H, 0)
+	seen := make(map[string]struct{}, len(req.IDs))
+	for _, rawID := range req.IDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+
+		auth, ok := h.authManager.GetByID(id)
+		if !ok || auth == nil {
+			skipped = append(skipped, gin.H{"id": id, "reason": "not_found"})
+			continue
+		}
+		if auth.AccountSource() != coreauth.AccountSourceBatch {
+			skipped = append(skipped, gin.H{"id": id, "reason": "not_batch"})
+			continue
+		}
+
+		if mode == "disable" {
+			auth.Disabled = true
+			auth.Status = coreauth.StatusDisabled
+			auth.StatusMessage = "disabled via batch cleanup"
+			auth.UpdatedAt = time.Now()
+			if _, err := h.authManager.Update(ctx, auth); err != nil {
+				skipped = append(skipped, gin.H{"id": id, "reason": err.Error()})
+				continue
+			}
+			processed = append(processed, id)
+			continue
+		}
+
+		path := strings.TrimSpace(authAttribute(auth, "path"))
+		if path == "" {
+			skipped = append(skipped, gin.H{"id": id, "reason": "missing_path"})
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			skipped = append(skipped, gin.H{"id": id, "reason": err.Error()})
+			continue
+		}
+		if err := h.deleteTokenRecord(ctx, path); err != nil {
+			skipped = append(skipped, gin.H{"id": id, "reason": err.Error()})
+			continue
+		}
+		h.disableAuth(ctx, id)
+		processed = append(processed, id)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "ok",
+		"mode":      mode,
+		"processed": processed,
+		"skipped":   skipped,
+	})
 }
 
 func (h *Handler) disableAuth(ctx context.Context, id string) {

@@ -192,6 +192,13 @@ nonstream-keepalive-interval: 0
 #   user-agent: "codex_cli_rs/0.114.0 (Mac OS 14.2.0; x86_64) vscode/1.111.0"
 #   beta-features: "multi_agent"
 
+# Codex team account handling.
+# When disabled, team organizations are only exposed in the management API/UI.
+# When enabled, CLIProxyAPI creates runtime-only virtual auths for each discovered
+# organization and injects OpenAI-Organization on Codex OAuth requests.
+# codex-team:
+#   experimental-workspace-routing: false
+
 # OpenAI compatibility providers
 # openai-compatibility:
 #   - name: "openrouter" # The name of the provider; it will be used in the user agent and other places.

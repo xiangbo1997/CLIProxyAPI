@@ -249,9 +249,9 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 }
 
 // Pick selects the next available auth for the provider in a round-robin manner.
-// For gemini-cli virtual auths (identified by the gemini_virtual_parent attribute),
-// a two-level round-robin is used: first cycling across credential groups (parent
-// accounts), then cycling within each group's project auths.
+// For grouped virtual auths (Gemini projects or Codex team workspaces), a two-level
+// round-robin is used: first cycling across credential groups (parent accounts),
+// then cycling within each group's virtual children.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
@@ -270,8 +270,8 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		limit = 4096
 	}
 
-	// Check if any available auth has gemini_virtual_parent attribute,
-	// indicating gemini-cli virtual auths that should use credential-level polling.
+	// Check if available auths belong to a virtual parent group so selection can
+	// spread across parents before cycling within a specific group's children.
 	groups, parentOrder := groupByVirtualParent(available)
 	if len(parentOrder) > 1 {
 		// Two-level round-robin: first select a credential group, then pick within it.
@@ -321,10 +321,14 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 	}
 }
 
-// groupByVirtualParent groups auths by their gemini_virtual_parent attribute.
+// groupByVirtualParent groups auths by their virtual parent attribute.
 // Returns a map of parentID -> auths and a sorted slice of parent IDs for stable iteration.
-// Only auths with a non-empty gemini_virtual_parent are grouped; if any auth lacks
-// this attribute, nil/nil is returned so the caller falls back to flat round-robin.
+// Supported attributes:
+//   - gemini_virtual_parent
+//   - codex_virtual_parent
+//
+// If any auth lacks a supported virtual-parent attribute, nil/nil is returned so
+// the caller falls back to flat round-robin.
 func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
 	if len(auths) == 0 {
 		return nil, nil
@@ -334,6 +338,9 @@ func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
 		parent := ""
 		if a.Attributes != nil {
 			parent = strings.TrimSpace(a.Attributes["gemini_virtual_parent"])
+			if parent == "" {
+				parent = strings.TrimSpace(a.Attributes["codex_virtual_parent"])
+			}
 		}
 		if parent == "" {
 			// Non-virtual auth present; fall back to flat round-robin.

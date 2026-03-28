@@ -179,6 +179,13 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		ctx = context.Background()
 	}
 
+	if override := strings.TrimSpace(os.Getenv("MANAGEMENT_STATIC_PATH")); override != "" {
+		overridePath := filepath.Clean(override)
+		if _, err := os.Stat(overridePath); err == nil {
+			return true
+		}
+	}
+
 	staticDir = strings.TrimSpace(staticDir)
 	if staticDir == "" {
 		log.Debug("management asset sync skipped: empty static directory")

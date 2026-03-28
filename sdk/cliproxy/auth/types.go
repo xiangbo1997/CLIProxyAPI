@@ -95,6 +95,11 @@ type Auth struct {
 	indexAssigned bool `json:"-"`
 }
 
+const (
+	AccountSourceOwned = "owned"
+	AccountSourceBatch = "batch"
+)
+
 // QuotaState contains limiter tracking data for a credential.
 type QuotaState struct {
 	// Exceeded indicates the credential recently hit a quota error.
@@ -327,6 +332,64 @@ func (a *Auth) RequestRetryOverride() (int, bool) {
 	return 0, false
 }
 
+// AccountSource returns the persisted auth source classification.
+// Missing or invalid values default to owned to avoid accidental cleanup.
+func (a *Auth) AccountSource() string {
+	if a == nil || a.Metadata == nil {
+		return AccountSourceOwned
+	}
+	if val, ok := a.Metadata["account_source"]; ok {
+		if parsed, okParse := parseStringEnumAny(val, AccountSourceOwned, AccountSourceBatch); okParse {
+			return parsed
+		}
+	}
+	if val, ok := a.Metadata["account-source"]; ok {
+		if parsed, okParse := parseStringEnumAny(val, AccountSourceOwned, AccountSourceBatch); okParse {
+			return parsed
+		}
+	}
+	return AccountSourceOwned
+}
+
+// SetAccountSource persists the auth source classification in metadata.
+func (a *Auth) SetAccountSource(source string) {
+	if a == nil {
+		return
+	}
+	source = normalizeAccountSource(source)
+	if a.Metadata == nil {
+		a.Metadata = make(map[string]any)
+	}
+	a.Metadata["account_source"] = source
+	delete(a.Metadata, "account-source")
+}
+
+func normalizeAccountSource(source string) string {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case AccountSourceBatch:
+		return AccountSourceBatch
+	default:
+		return AccountSourceOwned
+	}
+}
+
+func parseStringEnumAny(val any, allowed ...string) (string, bool) {
+	raw, ok := val.(string)
+	if !ok {
+		return "", false
+	}
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	if normalized == "" {
+		return "", false
+	}
+	for _, candidate := range allowed {
+		if normalized == candidate {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
 func parseBoolAny(val any) (bool, bool) {
 	switch typed := val.(type) {
 	case bool:
@@ -402,6 +465,26 @@ func (a *Auth) AccountInfo() (string, string) {
 					}
 				}
 				return "oauth", email
+			}
+		}
+	}
+
+	// For Codex virtual workspace auths, include workspace title or ID in the display value.
+	if strings.ToLower(a.Provider) == "codex" {
+		if a.Metadata != nil {
+			email, _ := a.Metadata["email"].(string)
+			email = strings.TrimSpace(email)
+			if email != "" {
+				workspaceTitle, _ := a.Metadata["workspace_title"].(string)
+				workspaceTitle = strings.TrimSpace(workspaceTitle)
+				workspaceID, _ := a.Metadata["workspace_id"].(string)
+				workspaceID = strings.TrimSpace(workspaceID)
+				if workspaceTitle != "" {
+					return "oauth", email + " (" + workspaceTitle + ")"
+				}
+				if workspaceID != "" {
+					return "oauth", email + " (" + workspaceID + ")"
+				}
 			}
 		}
 	}

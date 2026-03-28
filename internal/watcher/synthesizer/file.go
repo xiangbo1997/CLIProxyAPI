@@ -158,13 +158,30 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
-	// For codex auth files, extract plan_type from the JWT id_token.
+	// For codex auth files, extract team metadata from the JWT id_token.
 	if provider == "codex" {
 		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
 			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
 				if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
 					a.Attributes["plan_type"] = pt
 				}
+				if accountID := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID); accountID != "" {
+					a.Attributes["chatgpt_account_id"] = accountID
+				}
+				if orgIDs := joinCodexOrganizationIDs(claims.GetOrganizations()); orgIDs != "" {
+					a.Attributes["codex_workspace_ids"] = orgIDs
+				}
+			}
+		}
+		if cfg != nil && cfg.CodexTeam.ExperimentalWorkspaceRouting {
+			if virtuals := SynthesizeCodexTeamVirtualAuths(a, metadata, now); len(virtuals) > 0 {
+				for _, v := range virtuals {
+					ApplyAuthExcludedModelsMeta(v, cfg, perAccountExcluded, "oauth")
+				}
+				out := make([]*coreauth.Auth, 0, 1+len(virtuals))
+				out = append(out, a)
+				out = append(out, virtuals...)
+				return out
 			}
 		}
 	}
@@ -180,6 +197,99 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	return []*coreauth.Auth{a}
+}
+
+// SynthesizeCodexTeamVirtualAuths creates runtime-only virtual auths for team organizations.
+// It disables the primary auth and creates one virtual auth per organization/workspace.
+func SynthesizeCodexTeamVirtualAuths(primary *coreauth.Auth, metadata map[string]any, now time.Time) []*coreauth.Auth {
+	if primary == nil || metadata == nil {
+		return nil
+	}
+	idTokenRaw, _ := metadata["id_token"].(string)
+	idToken := strings.TrimSpace(idTokenRaw)
+	if idToken == "" {
+		return nil
+	}
+	claims, errParse := codex.ParseJWTToken(idToken)
+	if errParse != nil || claims == nil {
+		return nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType), "team") {
+		return nil
+	}
+	orgs := dedupeCodexOrganizations(claims.GetOrganizations())
+	if len(orgs) <= 1 {
+		return nil
+	}
+
+	primary.Disabled = true
+	primary.Status = coreauth.StatusDisabled
+	if primary.Attributes == nil {
+		primary.Attributes = make(map[string]string)
+	}
+	primary.Attributes["codex_virtual_primary"] = "true"
+	primary.Attributes["virtual_children"] = joinCodexOrganizationIDs(orgs)
+
+	source := primary.Attributes["source"]
+	authPath := primary.Attributes["path"]
+	label := primary.Label
+	if label == "" {
+		label = primary.Provider
+	}
+
+	virtuals := make([]*coreauth.Auth, 0, len(orgs))
+	for _, org := range orgs {
+		attrs := map[string]string{
+			"runtime_only":               "true",
+			"codex_virtual_parent":       primary.ID,
+			"codex_workspace_id":         org.ID,
+			"codex_workspace_title":      org.Title,
+			"codex_workspace_role":       org.Role,
+			"codex_workspace_default":    strconv.FormatBool(org.IsDefault),
+			"routing_status":             "routing_verified",
+			"header:OpenAI-Organization": org.ID,
+		}
+		if source != "" {
+			attrs["source"] = source
+		}
+		if authPath != "" {
+			attrs["path"] = authPath
+		}
+		if priorityVal, hasPriority := primary.Attributes["priority"]; hasPriority && priorityVal != "" {
+			attrs["priority"] = priorityVal
+		}
+		if noteVal, hasNote := primary.Attributes["note"]; hasNote && noteVal != "" {
+			attrs["note"] = noteVal
+		}
+
+		metadataCopy := make(map[string]any, len(metadata)+4)
+		for k, v := range metadata {
+			metadataCopy[k] = v
+		}
+		metadataCopy["virtual"] = true
+		metadataCopy["virtual_parent_id"] = primary.ID
+		metadataCopy["workspace_id"] = org.ID
+		metadataCopy["workspace_title"] = org.Title
+		metadataCopy["workspace_role"] = org.Role
+
+		displayTitle := org.Title
+		if displayTitle == "" {
+			displayTitle = org.ID
+		}
+		virtuals = append(virtuals, &coreauth.Auth{
+			ID:         buildCodexVirtualID(primary.ID, org.ID),
+			Provider:   primary.Provider,
+			Label:      fmt.Sprintf("%s [%s]", label, displayTitle),
+			Status:     coreauth.StatusActive,
+			Attributes: attrs,
+			Metadata:   metadataCopy,
+			ProxyURL:   primary.ProxyURL,
+			Prefix:     primary.Prefix,
+			CreatedAt:  primary.CreatedAt,
+			UpdatedAt:  now,
+		})
+	}
+	return virtuals
 }
 
 // SynthesizeGeminiVirtualAuths creates virtual Auth entries for multi-project Gemini credentials.
@@ -304,6 +414,53 @@ func buildGeminiVirtualID(baseID, projectID string) string {
 	}
 	replacer := strings.NewReplacer("/", "_", "\\", "_", " ", "_")
 	return fmt.Sprintf("%s::%s", baseID, replacer.Replace(project))
+}
+
+func buildCodexVirtualID(baseID, workspaceID string) string {
+	workspace := strings.TrimSpace(workspaceID)
+	if workspace == "" {
+		workspace = "workspace"
+	}
+	replacer := strings.NewReplacer("/", "_", "\\", "_", " ", "_")
+	return fmt.Sprintf("%s::codex-org::%s", baseID, replacer.Replace(workspace))
+}
+
+func joinCodexOrganizationIDs(orgs []codex.Organizations) string {
+	if len(orgs) == 0 {
+		return ""
+	}
+	ids := make([]string, 0, len(orgs))
+	for _, org := range orgs {
+		if trimmed := strings.TrimSpace(org.ID); trimmed != "" {
+			ids = append(ids, trimmed)
+		}
+	}
+	return strings.Join(ids, ",")
+}
+
+func dedupeCodexOrganizations(orgs []codex.Organizations) []codex.Organizations {
+	if len(orgs) == 0 {
+		return nil
+	}
+	out := make([]codex.Organizations, 0, len(orgs))
+	seen := make(map[string]struct{}, len(orgs))
+	for _, org := range orgs {
+		id := strings.TrimSpace(org.ID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, codex.Organizations{
+			ID:        id,
+			IsDefault: org.IsDefault,
+			Role:      strings.TrimSpace(org.Role),
+			Title:     strings.TrimSpace(org.Title),
+		})
+	}
+	return out
 }
 
 // extractExcludedModelsFromMetadata reads per-account excluded models from the OAuth JSON metadata.
