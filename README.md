@@ -72,6 +72,14 @@ Get 10% OFF GLM CODING PLAN：https://z.ai/subscribe?ic=8JVLJQFSKB
 
 CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
+For local repo-based development, keep your auth directory consistent with the files you actually use. If your credentials live under `./auths`, set:
+
+```yaml
+auth-dir: "./auths"
+```
+
+After startup, check the log line that reports loaded auth entries. If it shows `0 auth entries`, the server usually started fine but did not load the credential directory you expected.
+
 ## Management API
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)

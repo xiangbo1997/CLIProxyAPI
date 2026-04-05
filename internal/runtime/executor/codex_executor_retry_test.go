@@ -73,6 +73,19 @@ func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {
 	}
 }
 
+func TestNewCodexStatusErrTreatsUnauthorizedQuotaAsRetryableRateLimit(t *testing.T) {
+	body := []byte(`{"detail":"Unauthorized"}`)
+
+	err := newCodexStatusErr(http.StatusUnauthorized, body)
+
+	if got := err.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if err.RetryAfter() != nil {
+		t.Fatalf("expected nil explicit retryAfter for unauthorized quota fallback, got %v", *err.RetryAfter())
+	}
+}
+
 func itoa(v int64) string {
 	return strconv.FormatInt(v, 10)
 }

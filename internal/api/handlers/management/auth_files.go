@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1347,6 +1348,10 @@ func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.Fil
 }
 
 func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
+	if converted, autoName, ok := tryParseOpenAISessionJSON(data); ok {
+		data = converted
+		name = autoName
+	}
 	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
 	if !filepath.IsAbs(dst) {
 		if abs, errAbs := filepath.Abs(dst); errAbs == nil {
@@ -1364,6 +1369,75 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		return err
 	}
 	return nil
+}
+
+// tryParseOpenAISessionJSON detects a raw OpenAI browser session JSON (the object
+// containing accessToken, sessionToken, user, account fields) and converts it into
+// a standard CodexTokenStorage JSON. Returns the converted bytes, the computed
+// credential filename, and true when the input matches the expected shape.
+func tryParseOpenAISessionJSON(data []byte) (tokenData []byte, fileName string, ok bool) {
+	var session struct {
+		AccessToken  string `json:"accessToken"`
+		SessionToken string `json:"sessionToken"`
+		Expires      string `json:"expires"`
+		User         struct {
+			Email string `json:"email"`
+		} `json:"user"`
+		Account struct {
+			ID       string `json:"id"`
+			PlanType string `json:"planType"`
+		} `json:"account"`
+	}
+	if err := json.Unmarshal(data, &session); err != nil {
+		return nil, "", false
+	}
+	if session.AccessToken == "" || session.User.Email == "" || session.Account.ID == "" {
+		return nil, "", false
+	}
+
+	digest := sha256.Sum256([]byte(session.Account.ID))
+	hashAccountID := hex.EncodeToString(digest[:])[:8]
+	fileName = codex.CredentialFileName(session.User.Email, session.Account.PlanType, hashAccountID, true)
+
+	idToken := buildCompatIDTokenForCPA(session.Account.ID, session.Account.PlanType, session.User.Email)
+
+	storage := codex.CodexTokenStorage{
+		IDToken:      idToken,
+		AccessToken:  session.AccessToken,
+		RefreshToken: session.SessionToken,
+		AccountID:    session.Account.ID,
+		Email:        session.User.Email,
+		Expire:       session.Expires,
+		LastRefresh:  time.Now().UTC().Format(time.RFC3339),
+		Type:         "codex",
+	}
+	tokenData, err := json.Marshal(storage)
+	if err != nil {
+		return nil, "", false
+	}
+	return tokenData, fileName, true
+}
+
+// buildCompatIDTokenForCPA constructs a minimal unsigned JWT whose payload contains
+// the chatgpt_account_id under the standard OpenAI auth claim. The signature is a
+// placeholder — ParseJWTToken (and the management UI) only read the payload and do
+// not verify the signature.
+func buildCompatIDTokenForCPA(accountID, planType, email string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT","kid":"compat"}`))
+
+	payload := map[string]any{
+		"email": email,
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": accountID,
+			"chatgpt_plan_type":  planType,
+		},
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	encodedPayload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+	return header + "." + encodedPayload + ".compat_sig"
 }
 
 func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {

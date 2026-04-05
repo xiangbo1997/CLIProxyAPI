@@ -24,5 +24,6 @@ services:
     volumes:
       - ${CLI_PROXY_CONFIG_PATH:-./config.yaml}:/CLIProxyAPI/config.yaml
       - ${CLI_PROXY_AUTH_PATH:-./auths}:/root/.cli-proxy-api
+      - ${CLI_PROXY_AUTH_PATH:-./auths}:/CLIProxyAPI/auths
       - ${CLI_PROXY_LOG_PATH:-./logs}:/CLIProxyAPI/logs
     restart: unless-stopped

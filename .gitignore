@@ -27,7 +27,10 @@ auths/*
 
 # Documentation
 docs/*
+!docs/development.md
+!docs/deployment.md
 AGENTS.md
+!AGENTS.md
 CLAUDE.md
 GEMINI.md
 

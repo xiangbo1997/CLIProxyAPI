@@ -692,6 +692,8 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	errCode := statusCode
 	if isCodexModelCapacityError(body) {
 		errCode = http.StatusTooManyRequests
+	} else if isCodexQuotaUnauthorized(statusCode, body) {
+		errCode = http.StatusTooManyRequests
 	}
 	err := statusErr{code: errCode, msg: string(body)}
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
@@ -706,6 +708,18 @@ func normalizeCodexInstructions(body []byte) []byte {
 		body, _ = sjson.SetBytes(body, "instructions", "")
 	}
 	return body
+}
+
+// isCodexQuotaUnauthorized detects the case where Codex returns 401 {"detail":"Unauthorized"}
+// due to quota exhaustion on the Free tier, rather than an actually invalid token.
+// A genuinely invalid/expired token would also cause quota refresh to fail, but quota
+// refresh succeeds in this scenario, confirming the 401 is quota-related.
+func isCodexQuotaUnauthorized(statusCode int, body []byte) bool {
+	if statusCode != http.StatusUnauthorized || len(body) == 0 {
+		return false
+	}
+	detail := strings.TrimSpace(gjson.GetBytes(body, "detail").String())
+	return strings.EqualFold(detail, "unauthorized")
 }
 
 func isCodexModelCapacityError(errorBody []byte) bool {
