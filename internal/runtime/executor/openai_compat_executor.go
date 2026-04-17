@@ -158,9 +158,40 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		// For transient gateway errors, retry once after a short delay before giving up.
+		if isTransientGatewayError(httpResp.StatusCode) {
+			helps.LogWithRequestID(ctx).Warnf("openai compat executor: transient %d from upstream %s, retrying in 1s", httpResp.StatusCode, url)
+			if errWait := sleepContext(ctx, time.Second); errWait == nil {
+				retryReq, errRetry := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
+				if errRetry == nil {
+					retryReq.Header = httpReq.Header.Clone()
+					retryClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+					retryResp, errDo := retryClient.Do(retryReq)
+					if errDo == nil {
+						helps.RecordAPIResponseMetadata(ctx, e.cfg, retryResp.StatusCode, retryResp.Header.Clone())
+						defer func() {
+							if errClose := retryResp.Body.Close(); errClose != nil {
+								log.Errorf("openai compat executor: close retry response body error: %v", errClose)
+							}
+						}()
+						if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
+							httpResp = retryResp
+							goto readBody
+						}
+						rb, _ := io.ReadAll(retryResp.Body)
+						helps.AppendAPIResponseChunk(ctx, e.cfg, rb)
+						helps.LogWithRequestID(ctx).Debugf("openai compat executor: retry also failed, status: %d, message: %s", retryResp.StatusCode, helps.SummarizeErrorBody(retryResp.Header.Get("Content-Type"), rb))
+						err = statusErr{code: retryResp.StatusCode, msg: string(rb)}
+						return resp, err
+					}
+					helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+				}
+			}
+		}
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return resp, err
 	}
+readBody:
 	body, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -256,12 +287,45 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("openai compat executor: close response body error: %v", errClose)
+		// For transient gateway errors, retry the stream request once before giving up.
+		if isTransientGatewayError(httpResp.StatusCode) {
+			helps.LogWithRequestID(ctx).Warnf("openai compat executor: transient %d from upstream %s (stream), retrying in 1s", httpResp.StatusCode, url)
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("openai compat executor: close response body error: %v", errClose)
+			}
+			if errWait := sleepContext(ctx, time.Second); errWait == nil {
+				retryReq, errRetry := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
+				if errRetry == nil {
+					retryReq.Header = httpReq.Header.Clone()
+					retryClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+					retryResp, errDo := retryClient.Do(retryReq)
+					if errDo == nil {
+						helps.RecordAPIResponseMetadata(ctx, e.cfg, retryResp.StatusCode, retryResp.Header.Clone())
+						if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
+							httpResp = retryResp
+							goto streamOK
+						}
+						rb, _ := io.ReadAll(retryResp.Body)
+						helps.AppendAPIResponseChunk(ctx, e.cfg, rb)
+						helps.LogWithRequestID(ctx).Debugf("openai compat executor: stream retry also failed, status: %d, message: %s", retryResp.StatusCode, helps.SummarizeErrorBody(retryResp.Header.Get("Content-Type"), rb))
+						if errClose := retryResp.Body.Close(); errClose != nil {
+							log.Errorf("openai compat executor: close retry response body error: %v", errClose)
+						}
+						err = statusErr{code: retryResp.StatusCode, msg: string(rb)}
+						return nil, err
+					}
+					helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+				}
+			}
+		} else {
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("openai compat executor: close response body error: %v", errClose)
+			}
 		}
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return nil, err
 	}
+streamOK:
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -298,6 +362,14 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+		} else {
+			// In case the upstream close the stream without a terminal [DONE] marker.
+			// Feed a synthetic done marker through the translator so pending
+			// response.completed events are still emitted exactly once.
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param)
+			for i := range chunks {
+				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
+			}
 		}
 		// Ensure we record the request if no usage chunk was ever seen
 		reporter.EnsurePublished(ctx)
@@ -401,3 +473,21 @@ func (e statusErr) Error() string {
 }
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
+
+// isTransientGatewayError returns true for HTTP status codes that indicate a
+// transient upstream failure worth retrying immediately (502, 503, 504).
+func isTransientGatewayError(code int) bool {
+	return code == http.StatusBadGateway || code == http.StatusServiceUnavailable || code == http.StatusGatewayTimeout
+}
+
+// sleepContext sleeps for d or until ctx is done, returning ctx.Err() on cancellation.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}

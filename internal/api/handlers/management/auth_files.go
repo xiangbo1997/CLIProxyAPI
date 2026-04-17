@@ -27,9 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
-	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -63,6 +61,7 @@ var (
 	callbackForwarders    = make(map[int]*callbackForwarder)
 	errAuthFileMustBeJSON = errors.New("auth file must be .json")
 	errAuthFileNotFound   = errors.New("auth file not found")
+	errAuthFileBulkDelete = errors.New("bulk auth file deletion temporarily disabled for safety; delete files one at a time")
 )
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
@@ -131,6 +130,150 @@ func isWebUIRequest(c *gin.Context) bool {
 	}
 }
 
+func managementRequestAuditFields(c *gin.Context) log.Fields {
+	fields := log.Fields{}
+	if c == nil {
+		return fields
+	}
+	fields["client_ip"] = strings.TrimSpace(c.ClientIP())
+	if c.Request == nil {
+		return fields
+	}
+	fields["method"] = strings.TrimSpace(c.Request.Method)
+	fields["path"] = strings.TrimSpace(c.Request.URL.Path)
+	if route := strings.TrimSpace(c.FullPath()); route != "" {
+		fields["route"] = route
+	}
+	if rawQuery := strings.TrimSpace(c.Request.URL.RawQuery); rawQuery != "" {
+		fields["query"] = rawQuery
+	}
+	if remoteAddr := strings.TrimSpace(c.Request.RemoteAddr); remoteAddr != "" {
+		fields["remote_addr"] = remoteAddr
+	}
+	if forwardedFor := strings.TrimSpace(c.GetHeader("X-Forwarded-For")); forwardedFor != "" {
+		fields["forwarded_for"] = forwardedFor
+	}
+	if realIP := strings.TrimSpace(c.GetHeader("X-Real-IP")); realIP != "" {
+		fields["real_ip"] = realIP
+	}
+	if userAgent := strings.TrimSpace(c.Request.UserAgent()); userAgent != "" {
+		fields["user_agent"] = userAgent
+	}
+	if origin := strings.TrimSpace(c.GetHeader("Origin")); origin != "" {
+		fields["origin"] = origin
+	}
+	if referer := strings.TrimSpace(c.Request.Referer()); referer != "" {
+		fields["referer"] = referer
+	}
+	if requestID := strings.TrimSpace(c.GetHeader("X-Request-Id")); requestID != "" {
+		fields["request_id"] = requestID
+	}
+	if requestID := strings.TrimSpace(c.GetHeader("X-Request-ID")); requestID != "" {
+		fields["request_id_alt"] = requestID
+	}
+	if forwardedProto := strings.TrimSpace(c.GetHeader("X-Forwarded-Proto")); forwardedProto != "" {
+		fields["forwarded_proto"] = forwardedProto
+	}
+	if forwardedHost := strings.TrimSpace(c.GetHeader("X-Forwarded-Host")); forwardedHost != "" {
+		fields["forwarded_host"] = forwardedHost
+	}
+	if host := strings.TrimSpace(c.Request.Host); host != "" {
+		fields["host"] = host
+	}
+	if contentType := strings.TrimSpace(c.ContentType()); contentType != "" {
+		fields["content_type"] = contentType
+	}
+	if uiAction := strings.TrimSpace(c.GetHeader("X-CPA-UI-Action")); uiAction != "" {
+		fields["ui_action_header"] = uiAction
+	}
+	if uiSurface := strings.TrimSpace(c.GetHeader("X-CPA-UI-Surface")); uiSurface != "" {
+		fields["ui_surface_header"] = uiSurface
+	}
+	return fields
+}
+
+func mergeAuditFields(base log.Fields, extras ...log.Fields) log.Fields {
+	merged := make(log.Fields, len(base))
+	for key, value := range base {
+		merged[key] = value
+	}
+	for _, extra := range extras {
+		for key, value := range extra {
+			merged[key] = value
+		}
+	}
+	return merged
+}
+
+func authDeleteAuditEntry(c *gin.Context, action string, extra log.Fields) *log.Entry {
+	fields := mergeAuditFields(managementRequestAuditFields(c), log.Fields{
+		"audit":  "auth_file_mutation",
+		"action": action,
+	}, extra)
+	return log.WithFields(fields)
+}
+
+func managementCallerSurfaceHint(c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return "unknown"
+	}
+	referer := strings.ToLower(strings.TrimSpace(c.Request.Referer()))
+	origin := strings.ToLower(strings.TrimSpace(c.GetHeader("Origin")))
+	userAgent := strings.ToLower(strings.TrimSpace(c.Request.UserAgent()))
+
+	if strings.Contains(referer, "/management.html") || strings.Contains(origin, "/management.html") {
+		return "management_html"
+	}
+	if strings.Contains(userAgent, "go-http-client") {
+		return "go_client_or_tui"
+	}
+	if strings.Contains(userAgent, "curl/") {
+		return "curl"
+	}
+	if strings.Contains(userAgent, "mozilla/") || strings.Contains(userAgent, "chrome/") || strings.Contains(userAgent, "safari/") || strings.Contains(userAgent, "firefox/") {
+		return "browser_or_webview"
+	}
+	return "unknown"
+}
+
+func authDeleteUIHint(mode string, requestedCount int, requestedAll bool) string {
+	switch {
+	case requestedAll:
+		return "auth_files.delete_all_button"
+	case mode == "named" && requestedCount == 1:
+		return "auth_files.delete_single_button"
+	case mode == "named" && requestedCount > 1:
+		return "auth_files.delete_selected_button"
+	case mode == "delete":
+		return "auth_files.batch_cleanup_delete_button"
+	case mode == "disable":
+		return "auth_files.batch_cleanup_disable_button"
+	default:
+		return "auth_files.unknown_action"
+	}
+}
+
+// 临时安全闸：批量/全量删除已出现误触发，只保留单文件删除，待前端补上更强确认后再放开。
+func rejectBulkAuthDelete(c *gin.Context, mode string, names []string, requestedAll bool) bool {
+	if !requestedAll && len(names) <= 1 {
+		return false
+	}
+	authDeleteAuditEntry(c, "delete_request_blocked", log.Fields{
+		"mode":                mode,
+		"requested_all":       requestedAll,
+		"requested_names":     names,
+		"requested_count":     len(names),
+		"reason":              "bulk_delete_temporarily_disabled",
+		"ui_action_hint":      authDeleteUIHint(mode, len(names), requestedAll),
+		"caller_surface_hint": managementCallerSurfaceHint(c),
+	}).Warn("management auth file deletion blocked by safety interlock")
+	c.JSON(http.StatusConflict, gin.H{
+		"error": errAuthFileBulkDelete.Error(),
+		"code":  "bulk_delete_temporarily_disabled",
+	})
+	return true
+}
+
 func startCallbackForwarder(port int, provider, targetBase string) (*callbackForwarder, error) {
 	callbackForwardersMu.Lock()
 	prev := callbackForwarders[port]
@@ -143,7 +286,7 @@ func startCallbackForwarder(port int, provider, targetBase string) (*callbackFor
 		stopForwarderInstance(port, prev)
 	}
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on %s: %w", addr, err)
@@ -1217,7 +1360,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok"})
 }
 
-// Delete auth files: single by name or all
+// Delete auth files: single delete is allowed, bulk/all delete is temporarily blocked for safety.
 func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -1230,7 +1373,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 			return
 		}
-		deleted := 0
+		names := make([]string, 0, len(entries))
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
@@ -1239,22 +1382,44 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 			if !strings.HasSuffix(strings.ToLower(name), ".json") {
 				continue
 			}
-			full := filepath.Join(h.cfg.AuthDir, name)
-			if !filepath.IsAbs(full) {
-				if abs, errAbs := filepath.Abs(full); errAbs == nil {
-					full = abs
-				}
-			}
-			if err = os.Remove(full); err == nil {
-				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
-					c.JSON(500, gin.H{"error": errDel.Error()})
-					return
-				}
-				deleted++
-				h.disableAuth(ctx, full)
-			}
+			names = append(names, name)
 		}
-		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
+		authDeleteAuditEntry(c, "delete_request", log.Fields{
+			"mode":                "all",
+			"requested_names":     names,
+			"ui_action_hint":      authDeleteUIHint("named", len(names), true),
+			"caller_surface_hint": managementCallerSurfaceHint(c),
+		}).Warn("management auth file deletion requested")
+		if rejectBulkAuthDelete(c, "named", names, true) {
+			return
+		}
+		deletedFiles := make([]string, 0, len(names))
+		for _, name := range names {
+			deletedName, _, errDelete := h.deleteAuthFileByName(ctx, c, name)
+			if errDelete != nil {
+				authDeleteAuditEntry(c, "delete_request_failed", log.Fields{
+					"mode":                "all",
+					"requested_all":       true,
+					"deleted_files":       deletedFiles,
+					"failed_name":         name,
+					"error":               errDelete.Error(),
+					"ui_action_hint":      authDeleteUIHint("named", len(names), true),
+					"caller_surface_hint": managementCallerSurfaceHint(c),
+				}).Error("management auth file deletion aborted")
+				c.JSON(500, gin.H{"error": errDelete.Error()})
+				return
+			}
+			deletedFiles = append(deletedFiles, deletedName)
+		}
+		authDeleteAuditEntry(c, "delete_request_completed", log.Fields{
+			"mode":                "all",
+			"requested_all":       true,
+			"deleted_count":       len(deletedFiles),
+			"deleted_files":       deletedFiles,
+			"ui_action_hint":      authDeleteUIHint("named", len(names), true),
+			"caller_surface_hint": managementCallerSurfaceHint(c),
+		}).Warn("management auth file deletion completed")
+		c.JSON(200, gin.H{"status": "ok", "deleted": len(deletedFiles)})
 		return
 	}
 
@@ -1267,11 +1432,36 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid name"})
 		return
 	}
+	authDeleteAuditEntry(c, "delete_request", log.Fields{
+		"mode":                "named",
+		"requested_names":     names,
+		"ui_action_hint":      authDeleteUIHint("named", len(names), false),
+		"caller_surface_hint": managementCallerSurfaceHint(c),
+	}).Warn("management auth file deletion requested")
+	if rejectBulkAuthDelete(c, "named", names, false) {
+		return
+	}
 	if len(names) == 1 {
-		if _, status, errDelete := h.deleteAuthFileByName(ctx, names[0]); errDelete != nil {
+		deletedName, status, errDelete := h.deleteAuthFileByName(ctx, c, names[0])
+		if errDelete != nil {
+			authDeleteAuditEntry(c, "delete_request_failed", log.Fields{
+				"mode":                "named",
+				"requested_name":      names[0],
+				"status":              status,
+				"error":               errDelete.Error(),
+				"ui_action_hint":      authDeleteUIHint("named", len(names), false),
+				"caller_surface_hint": managementCallerSurfaceHint(c),
+			}).Warn("management auth file deletion failed")
 			c.JSON(status, gin.H{"error": errDelete.Error()})
 			return
 		}
+		authDeleteAuditEntry(c, "delete_request_completed", log.Fields{
+			"mode":                "named",
+			"deleted_count":       1,
+			"deleted_files":       []string{deletedName},
+			"ui_action_hint":      authDeleteUIHint("named", len(names), false),
+			"caller_surface_hint": managementCallerSurfaceHint(c),
+		}).Warn("management auth file deletion completed")
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 		return
 	}
@@ -1279,7 +1469,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	deletedFiles := make([]string, 0, len(names))
 	failed := make([]gin.H, 0)
 	for _, name := range names {
-		deletedName, _, errDelete := h.deleteAuthFileByName(ctx, name)
+		deletedName, _, errDelete := h.deleteAuthFileByName(ctx, c, name)
 		if errDelete != nil {
 			failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
 			continue
@@ -1287,6 +1477,14 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		deletedFiles = append(deletedFiles, deletedName)
 	}
 	if len(failed) > 0 {
+		authDeleteAuditEntry(c, "delete_request_partial", log.Fields{
+			"mode":                "named",
+			"deleted_count":       len(deletedFiles),
+			"deleted_files":       deletedFiles,
+			"failed":              failed,
+			"ui_action_hint":      authDeleteUIHint("named", len(names), false),
+			"caller_surface_hint": managementCallerSurfaceHint(c),
+		}).Warn("management auth file deletion partially completed")
 		c.JSON(http.StatusMultiStatus, gin.H{
 			"status":  "partial",
 			"deleted": len(deletedFiles),
@@ -1295,6 +1493,13 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		})
 		return
 	}
+	authDeleteAuditEntry(c, "delete_request_completed", log.Fields{
+		"mode":                "named",
+		"deleted_count":       len(deletedFiles),
+		"deleted_files":       deletedFiles,
+		"ui_action_hint":      authDeleteUIHint("named", len(names), false),
+		"caller_surface_hint": managementCallerSurfaceHint(c),
+	}).Warn("management auth file deletion completed")
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": len(deletedFiles), "files": deletedFiles})
 }
 
@@ -1501,9 +1706,13 @@ func uniqueAuthFileNames(names []string) []string {
 	return out
 }
 
-func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string, int, error) {
+func (h *Handler) deleteAuthFileByName(ctx context.Context, c *gin.Context, name string) (string, int, error) {
 	name = strings.TrimSpace(name)
 	if isUnsafeAuthFileName(name) {
+		authDeleteAuditEntry(c, "delete_target_invalid", log.Fields{
+			"requested_name":      name,
+			"caller_surface_hint": managementCallerSurfaceHint(c),
+		}).Warn("management auth file deletion rejected due to invalid name")
 		return "", http.StatusBadRequest, fmt.Errorf("invalid name")
 	}
 
@@ -1522,11 +1731,31 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	}
 	if errRemove := os.Remove(targetPath); errRemove != nil {
 		if os.IsNotExist(errRemove) {
+			authDeleteAuditEntry(c, "delete_target_missing", log.Fields{
+				"requested_name":      name,
+				"target_id":           targetID,
+				"target_path":         targetPath,
+				"caller_surface_hint": managementCallerSurfaceHint(c),
+			}).Warn("management auth file deletion target not found")
 			return filepath.Base(name), http.StatusNotFound, errAuthFileNotFound
 		}
+		authDeleteAuditEntry(c, "delete_target_remove_failed", log.Fields{
+			"requested_name":      name,
+			"target_id":           targetID,
+			"target_path":         targetPath,
+			"error":               errRemove.Error(),
+			"caller_surface_hint": managementCallerSurfaceHint(c),
+		}).Error("management auth file deletion failed during file removal")
 		return filepath.Base(name), http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
 	}
 	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
+		authDeleteAuditEntry(c, "delete_target_store_failed", log.Fields{
+			"requested_name":      name,
+			"target_id":           targetID,
+			"target_path":         targetPath,
+			"error":               errDeleteRecord.Error(),
+			"caller_surface_hint": managementCallerSurfaceHint(c),
+		}).Error("management auth file deletion failed during token store cleanup")
 		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
 	}
 	if targetID != "" {
@@ -1534,6 +1763,13 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	} else {
 		h.disableAuth(ctx, targetPath)
 	}
+	authDeleteAuditEntry(c, "delete_target_completed", log.Fields{
+		"requested_name":      name,
+		"deleted_name":        filepath.Base(name),
+		"target_id":           targetID,
+		"target_path":         targetPath,
+		"caller_surface_hint": managementCallerSurfaceHint(c),
+	}).Warn("management auth file deleted")
 	return filepath.Base(name), http.StatusOK, nil
 }
 
@@ -2129,10 +2365,17 @@ func (h *Handler) CleanupBatchAuthFiles(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "ids is required"})
 		return
 	}
+	authDeleteAuditEntry(c, "batch_cleanup_requested", log.Fields{
+		"mode":                mode,
+		"requested_ids":       req.IDs,
+		"ui_action_hint":      authDeleteUIHint(mode, len(req.IDs), false),
+		"caller_surface_hint": managementCallerSurfaceHint(c),
+	}).Warn("management batch auth cleanup requested")
 
 	ctx := c.Request.Context()
 	processed := make([]string, 0, len(req.IDs))
 	skipped := make([]gin.H, 0)
+	processedFiles := make([]string, 0, len(req.IDs))
 	seen := make(map[string]struct{}, len(req.IDs))
 	for _, rawID := range req.IDs {
 		id := strings.TrimSpace(rawID)
@@ -2146,10 +2389,24 @@ func (h *Handler) CleanupBatchAuthFiles(c *gin.Context) {
 
 		auth, ok := h.authManager.GetByID(id)
 		if !ok || auth == nil {
+			authDeleteAuditEntry(c, "batch_cleanup_skipped", log.Fields{
+				"mode":                mode,
+				"auth_id":             id,
+				"reason":              "not_found",
+				"ui_action_hint":      authDeleteUIHint(mode, len(req.IDs), false),
+				"caller_surface_hint": managementCallerSurfaceHint(c),
+			}).Warn("management batch auth cleanup skipped target")
 			skipped = append(skipped, gin.H{"id": id, "reason": "not_found"})
 			continue
 		}
 		if auth.AccountSource() != coreauth.AccountSourceBatch {
+			authDeleteAuditEntry(c, "batch_cleanup_skipped", log.Fields{
+				"mode":                mode,
+				"auth_id":             id,
+				"reason":              "not_batch",
+				"ui_action_hint":      authDeleteUIHint(mode, len(req.IDs), false),
+				"caller_surface_hint": managementCallerSurfaceHint(c),
+			}).Warn("management batch auth cleanup skipped target")
 			skipped = append(skipped, gin.H{"id": id, "reason": "not_batch"})
 			continue
 		}
@@ -2160,30 +2417,84 @@ func (h *Handler) CleanupBatchAuthFiles(c *gin.Context) {
 			auth.StatusMessage = "disabled via batch cleanup"
 			auth.UpdatedAt = time.Now()
 			if _, err := h.authManager.Update(ctx, auth); err != nil {
+				authDeleteAuditEntry(c, "batch_cleanup_disable_failed", log.Fields{
+					"mode":                mode,
+					"auth_id":             id,
+					"error":               err.Error(),
+					"ui_action_hint":      authDeleteUIHint(mode, len(req.IDs), false),
+					"caller_surface_hint": managementCallerSurfaceHint(c),
+				}).Error("management batch auth cleanup failed while disabling target")
 				skipped = append(skipped, gin.H{"id": id, "reason": err.Error()})
 				continue
 			}
 			processed = append(processed, id)
+			authDeleteAuditEntry(c, "batch_cleanup_disable_completed", log.Fields{
+				"mode":                mode,
+				"auth_id":             id,
+				"file_name":           auth.FileName,
+				"ui_action_hint":      authDeleteUIHint(mode, len(req.IDs), false),
+				"caller_surface_hint": managementCallerSurfaceHint(c),
+			}).Warn("management batch auth cleanup disabled target")
 			continue
 		}
 
 		path := strings.TrimSpace(authAttribute(auth, "path"))
 		if path == "" {
+			authDeleteAuditEntry(c, "batch_cleanup_skipped", log.Fields{
+				"mode":                mode,
+				"auth_id":             id,
+				"reason":              "missing_path",
+				"ui_action_hint":      authDeleteUIHint(mode, len(req.IDs), false),
+				"caller_surface_hint": managementCallerSurfaceHint(c),
+			}).Warn("management batch auth cleanup skipped target")
 			skipped = append(skipped, gin.H{"id": id, "reason": "missing_path"})
 			continue
 		}
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			authDeleteAuditEntry(c, "batch_cleanup_delete_failed", log.Fields{
+				"mode":                mode,
+				"auth_id":             id,
+				"target_path":         path,
+				"error":               err.Error(),
+				"ui_action_hint":      authDeleteUIHint(mode, len(req.IDs), false),
+				"caller_surface_hint": managementCallerSurfaceHint(c),
+			}).Error("management batch auth cleanup failed during file removal")
 			skipped = append(skipped, gin.H{"id": id, "reason": err.Error()})
 			continue
 		}
 		if err := h.deleteTokenRecord(ctx, path); err != nil {
+			authDeleteAuditEntry(c, "batch_cleanup_delete_failed", log.Fields{
+				"mode":                mode,
+				"auth_id":             id,
+				"target_path":         path,
+				"error":               err.Error(),
+				"ui_action_hint":      authDeleteUIHint(mode, len(req.IDs), false),
+				"caller_surface_hint": managementCallerSurfaceHint(c),
+			}).Error("management batch auth cleanup failed during token store cleanup")
 			skipped = append(skipped, gin.H{"id": id, "reason": err.Error()})
 			continue
 		}
 		h.disableAuth(ctx, id)
 		processed = append(processed, id)
+		processedFiles = append(processedFiles, filepath.Base(path))
+		authDeleteAuditEntry(c, "batch_cleanup_delete_completed", log.Fields{
+			"mode":                mode,
+			"auth_id":             id,
+			"deleted_file":        filepath.Base(path),
+			"target_path":         path,
+			"ui_action_hint":      authDeleteUIHint(mode, len(req.IDs), false),
+			"caller_surface_hint": managementCallerSurfaceHint(c),
+		}).Warn("management batch auth cleanup deleted target")
 	}
 
+	authDeleteAuditEntry(c, "batch_cleanup_completed", log.Fields{
+		"mode":                mode,
+		"processed_ids":       processed,
+		"processed_files":     processedFiles,
+		"skipped":             skipped,
+		"ui_action_hint":      authDeleteUIHint(mode, len(req.IDs), false),
+		"caller_surface_hint": managementCallerSurfaceHint(c),
+	}).Warn("management batch auth cleanup completed")
 	c.JSON(http.StatusOK, gin.H{
 		"status":    "ok",
 		"mode":      mode,
@@ -2980,62 +3291,6 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
-func (h *Handler) RequestQwenToken(c *gin.Context) {
-	ctx := context.Background()
-	ctx = PopulateAuthContext(ctx, c)
-
-	fmt.Println("Initializing Qwen authentication...")
-
-	state := fmt.Sprintf("gem-%d", time.Now().UnixNano())
-	// Initialize Qwen auth service
-	qwenAuth := qwen.NewQwenAuth(h.cfg)
-
-	// Generate authorization URL
-	deviceFlow, err := qwenAuth.InitiateDeviceFlow(ctx)
-	if err != nil {
-		log.Errorf("Failed to generate authorization URL: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
-		return
-	}
-	authURL := deviceFlow.VerificationURIComplete
-
-	RegisterOAuthSession(state, "qwen")
-
-	go func() {
-		fmt.Println("Waiting for authentication...")
-		tokenData, errPollForToken := qwenAuth.PollForToken(deviceFlow.DeviceCode, deviceFlow.CodeVerifier)
-		if errPollForToken != nil {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Printf("Authentication failed: %v\n", errPollForToken)
-			return
-		}
-
-		// Create token storage
-		tokenStorage := qwenAuth.CreateTokenStorage(tokenData)
-
-		tokenStorage.Email = fmt.Sprintf("%d", time.Now().UnixMilli())
-		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("qwen-%s.json", tokenStorage.Email),
-			Provider: "qwen",
-			FileName: fmt.Sprintf("qwen-%s.json", tokenStorage.Email),
-			Storage:  tokenStorage,
-			Metadata: map[string]any{"email": tokenStorage.Email},
-		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
-		if errSave != nil {
-			log.Errorf("Failed to save authentication tokens: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
-			return
-		}
-
-		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
-		fmt.Println("You can now use Qwen services through this CLI")
-		CompleteOAuthSession(state)
-	}()
-
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
-}
-
 func (h *Handler) RequestKimiToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
@@ -3111,215 +3366,6 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
-}
-
-func (h *Handler) RequestIFlowToken(c *gin.Context) {
-	ctx := context.Background()
-	ctx = PopulateAuthContext(ctx, c)
-
-	fmt.Println("Initializing iFlow authentication...")
-
-	state := fmt.Sprintf("ifl-%d", time.Now().UnixNano())
-	authSvc := iflowauth.NewIFlowAuth(h.cfg)
-	authURL, redirectURI := authSvc.AuthorizationURL(state, iflowauth.CallbackPort)
-
-	RegisterOAuthSession(state, "iflow")
-
-	isWebUI := isWebUIRequest(c)
-	var forwarder *callbackForwarder
-	if isWebUI {
-		targetURL, errTarget := h.managementCallbackURL("/iflow/callback")
-		if errTarget != nil {
-			log.WithError(errTarget).Error("failed to compute iflow callback target")
-			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "callback server unavailable"})
-			return
-		}
-		var errStart error
-		if forwarder, errStart = startCallbackForwarder(iflowauth.CallbackPort, "iflow", targetURL); errStart != nil {
-			log.WithError(errStart).Error("failed to start iflow callback forwarder")
-			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to start callback server"})
-			return
-		}
-	}
-
-	go func() {
-		if isWebUI {
-			defer stopCallbackForwarderInstance(iflowauth.CallbackPort, forwarder)
-		}
-		fmt.Println("Waiting for authentication...")
-
-		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-iflow-%s.oauth", state))
-		deadline := time.Now().Add(5 * time.Minute)
-		var resultMap map[string]string
-		for {
-			if !IsOAuthSessionPending(state, "iflow") {
-				return
-			}
-			if time.Now().After(deadline) {
-				SetOAuthSessionError(state, "Authentication failed")
-				fmt.Println("Authentication failed: timeout waiting for callback")
-				return
-			}
-			if data, errR := os.ReadFile(waitFile); errR == nil {
-				_ = os.Remove(waitFile)
-				_ = json.Unmarshal(data, &resultMap)
-				break
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-
-		if errStr := strings.TrimSpace(resultMap["error"]); errStr != "" {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Printf("Authentication failed: %s\n", errStr)
-			return
-		}
-		if resultState := strings.TrimSpace(resultMap["state"]); resultState != state {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Println("Authentication failed: state mismatch")
-			return
-		}
-
-		code := strings.TrimSpace(resultMap["code"])
-		if code == "" {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Println("Authentication failed: code missing")
-			return
-		}
-
-		tokenData, errExchange := authSvc.ExchangeCodeForTokens(ctx, code, redirectURI)
-		if errExchange != nil {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Printf("Authentication failed: %v\n", errExchange)
-			return
-		}
-
-		tokenStorage := authSvc.CreateTokenStorage(tokenData)
-		identifier := strings.TrimSpace(tokenStorage.Email)
-		if identifier == "" {
-			identifier = fmt.Sprintf("%d", time.Now().UnixMilli())
-			tokenStorage.Email = identifier
-		}
-		record := &coreauth.Auth{
-			ID:         fmt.Sprintf("iflow-%s.json", identifier),
-			Provider:   "iflow",
-			FileName:   fmt.Sprintf("iflow-%s.json", identifier),
-			Storage:    tokenStorage,
-			Metadata:   map[string]any{"email": identifier, "api_key": tokenStorage.APIKey},
-			Attributes: map[string]string{"api_key": tokenStorage.APIKey},
-		}
-
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
-		if errSave != nil {
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
-			log.Errorf("Failed to save authentication tokens: %v", errSave)
-			return
-		}
-
-		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
-		if tokenStorage.APIKey != "" {
-			fmt.Println("API key obtained and saved")
-		}
-		fmt.Println("You can now use iFlow services through this CLI")
-		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("iflow")
-	}()
-
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
-}
-
-func (h *Handler) RequestIFlowCookieToken(c *gin.Context) {
-	ctx := context.Background()
-
-	var payload struct {
-		Cookie string `json:"cookie"`
-	}
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "cookie is required"})
-		return
-	}
-
-	cookieValue := strings.TrimSpace(payload.Cookie)
-
-	if cookieValue == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "cookie is required"})
-		return
-	}
-
-	cookieValue, errNormalize := iflowauth.NormalizeCookie(cookieValue)
-	if errNormalize != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errNormalize.Error()})
-		return
-	}
-
-	// Check for duplicate BXAuth before authentication
-	bxAuth := iflowauth.ExtractBXAuth(cookieValue)
-	if existingFile, err := iflowauth.CheckDuplicateBXAuth(h.cfg.AuthDir, bxAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to check duplicate"})
-		return
-	} else if existingFile != "" {
-		existingFileName := filepath.Base(existingFile)
-		c.JSON(http.StatusConflict, gin.H{"status": "error", "error": "duplicate BXAuth found", "existing_file": existingFileName})
-		return
-	}
-
-	authSvc := iflowauth.NewIFlowAuth(h.cfg)
-	tokenData, errAuth := authSvc.AuthenticateWithCookie(ctx, cookieValue)
-	if errAuth != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errAuth.Error()})
-		return
-	}
-
-	tokenData.Cookie = cookieValue
-
-	tokenStorage := authSvc.CreateCookieTokenStorage(tokenData)
-	email := strings.TrimSpace(tokenStorage.Email)
-	if email == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "failed to extract email from token"})
-		return
-	}
-
-	fileName := iflowauth.SanitizeIFlowFileName(email)
-	if fileName == "" {
-		fileName = fmt.Sprintf("iflow-%d", time.Now().UnixMilli())
-	} else {
-		fileName = fmt.Sprintf("iflow-%s", fileName)
-	}
-
-	tokenStorage.Email = email
-	timestamp := time.Now().Unix()
-
-	record := &coreauth.Auth{
-		ID:       fmt.Sprintf("%s-%d.json", fileName, timestamp),
-		Provider: "iflow",
-		FileName: fmt.Sprintf("%s-%d.json", fileName, timestamp),
-		Storage:  tokenStorage,
-		Metadata: map[string]any{
-			"email":        email,
-			"api_key":      tokenStorage.APIKey,
-			"expired":      tokenStorage.Expire,
-			"cookie":       tokenStorage.Cookie,
-			"type":         tokenStorage.Type,
-			"last_refresh": tokenStorage.LastRefresh,
-		},
-		Attributes: map[string]string{
-			"api_key": tokenStorage.APIKey,
-		},
-	}
-
-	savedPath, errSave := h.saveTokenRecord(ctx, record)
-	if errSave != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to save authentication tokens"})
-		return
-	}
-
-	fmt.Printf("iFlow cookie authentication successful. Token saved to %s\n", savedPath)
-	c.JSON(http.StatusOK, gin.H{
-		"status":     "ok",
-		"saved_path": savedPath,
-		"email":      email,
-		"expired":    tokenStorage.Expire,
-		"type":       tokenStorage.Type,
-	})
 }
 
 type projectSelectionRequiredError struct{}

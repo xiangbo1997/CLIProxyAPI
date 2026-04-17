@@ -177,21 +177,94 @@ func TestDeleteAuthFile_BatchQuery(t *testing.T) {
 
 	h.DeleteAuthFile(ctx)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusConflict, rec.Code, rec.Body.String())
 	}
 
 	var payload map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
-	if got, ok := payload["deleted"].(float64); !ok || int(got) != len(files) {
-		t.Fatalf("expected deleted=%d, got %#v", len(files), payload["deleted"])
+	if got, ok := payload["code"].(string); !ok || got != "bulk_delete_temporarily_disabled" {
+		t.Fatalf("expected safety code, got %#v", payload["code"])
 	}
 
 	for _, name := range files {
-		if _, err := os.Stat(filepath.Join(authDir, name)); !os.IsNotExist(err) {
-			t.Fatalf("expected auth file %s to be removed, stat err: %v", name, err)
+		if _, err := os.Stat(filepath.Join(authDir, name)); err != nil {
+			t.Fatalf("expected auth file %s to remain, stat err: %v", name, err)
 		}
+	}
+}
+
+func TestDeleteAuthFile_DeleteAllRejectedForSafety(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	files := []string{"alpha.json", "beta.json"}
+	for _, name := range files {
+		if err := os.WriteFile(filepath.Join(authDir, name), []byte(`{"type":"codex"}`), 0o600); err != nil {
+			t.Fatalf("failed to write auth file %s: %v", name, err)
+		}
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?all=1", nil)
+	ctx.Request = req
+
+	h.DeleteAuthFile(ctx)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusConflict, rec.Code, rec.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if got, ok := payload["code"].(string); !ok || got != "bulk_delete_temporarily_disabled" {
+		t.Fatalf("expected safety code, got %#v", payload["code"])
+	}
+
+	for _, name := range files {
+		if _, err := os.Stat(filepath.Join(authDir, name)); err != nil {
+			t.Fatalf("expected auth file %s to remain, stat err: %v", name, err)
+		}
+	}
+}
+
+func TestDeleteAuthFile_SingleJSONBodyStillAllowed(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	fileName := "alpha.json"
+	filePath := filepath.Join(authDir, fileName)
+	if err := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files", bytes.NewBufferString(`{"names":["alpha.json"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	h.DeleteAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
+		t.Fatalf("expected auth file to be removed, stat err: %v", err)
 	}
 }
