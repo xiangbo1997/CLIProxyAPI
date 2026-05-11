@@ -234,6 +234,16 @@ auth-dir: "./auths"
 
 远程请求默认受 `allow-remote` 限制，并带失败计数与临时封禁逻辑。
 
+### 6.4 Cloudflare 边缘拦截排查
+
+如果你遇到“源站直连正常，但经过 Cloudflare 某类请求头固定返回 403”的情况，优先先确认问题是否发生在边缘而不是 CLIProxyAPI 本身。
+
+针对 `User-Agent: OpenAI/Python ...` 被 Cloudflare 边缘拦截、而源站与本地 Caddy 均正常返回 `200` 的场景，仓库提供了一个可回滚的运维辅助脚本与说明文档：
+
+- [docs/cloudflare-openai-python-ua-bypass.md](/software/CLIProxyAPI/docs/cloudflare-openai-python-ua-bypass.md)
+
+它会帮助你通过 Cloudflare Rulesets API 创建一个尽量窄范围的 skip 规则，而不是去修改 CLIProxyAPI 或 Caddy 的业务逻辑。
+
 ## 7. TLS 与反向代理
 
 ### 7.1 内建 TLS

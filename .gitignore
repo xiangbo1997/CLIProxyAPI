@@ -1,5 +1,6 @@
 # Binaries
 cli-proxy-api
+CLIProxyAPI
 *.exe
 
 # Configuration
@@ -29,6 +30,7 @@ auths/*
 docs/*
 !docs/development.md
 !docs/deployment.md
+!docs/cloudflare-openai-python-ua-bypass.md
 AGENTS.md
 !AGENTS.md
 CLAUDE.md
@@ -38,6 +40,8 @@ GEMINI.md
 .vscode/*
 .worktrees/
 .codex/*
+.codex.*
+.playwright-mcp/
 .claude/*
 .gemini/*
 .serena/*
