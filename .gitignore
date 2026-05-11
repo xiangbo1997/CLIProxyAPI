@@ -57,3 +57,6 @@ _bmad-output/*
 # macOS
 .DS_Store
 ._*
+
+# Go module cache for offline builds
+.gocache/

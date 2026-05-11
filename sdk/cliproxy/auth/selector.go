@@ -18,9 +18,9 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
@@ -255,9 +255,9 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 }
 
 // Pick selects the next available auth for the provider in a round-robin manner.
-// For grouped virtual auths (Gemini projects or Codex team workspaces), a two-level
-// round-robin is used: first cycling across credential groups (parent accounts),
-// then cycling within each group's virtual children.
+// For gemini-cli virtual auths (identified by the gemini_virtual_parent attribute),
+// a two-level round-robin is used: first cycling across credential groups (parent
+// accounts), then cycling within each group's project auths.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
@@ -276,8 +276,8 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		limit = 4096
 	}
 
-	// Check if available auths belong to a virtual parent group so selection can
-	// spread across parents before cycling within a specific group's children.
+	// Check if any available auth has gemini_virtual_parent attribute,
+	// indicating gemini-cli virtual auths that should use credential-level polling.
 	groups, parentOrder := groupByVirtualParent(available)
 	if len(parentOrder) > 1 {
 		// Two-level round-robin: first select a credential group, then pick within it.
@@ -327,14 +327,10 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 	}
 }
 
-// groupByVirtualParent groups auths by their virtual parent attribute.
+// groupByVirtualParent groups auths by their gemini_virtual_parent attribute.
 // Returns a map of parentID -> auths and a sorted slice of parent IDs for stable iteration.
-// Supported attributes:
-//   - gemini_virtual_parent
-//   - codex_virtual_parent
-//
-// If any auth lacks a supported virtual-parent attribute, nil/nil is returned so
-// the caller falls back to flat round-robin.
+// Only auths with a non-empty gemini_virtual_parent are grouped; if any auth lacks
+// this attribute, nil/nil is returned so the caller falls back to flat round-robin.
 func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
 	if len(auths) == 0 {
 		return nil, nil
@@ -344,9 +340,6 @@ func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
 		parent := ""
 		if a.Attributes != nil {
 			parent = strings.TrimSpace(a.Attributes["gemini_virtual_parent"])
-			if parent == "" {
-				parent = strings.TrimSpace(a.Attributes["codex_virtual_parent"])
-			}
 		}
 		if parent == "" {
 			// Non-virtual auth present; fall back to flat round-robin.
@@ -476,11 +469,14 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 
 // Pick selects an auth with session affinity when possible.
 // Priority for session ID extraction:
-//  1. metadata.user_id (Claude Code format) - highest priority
+//  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority
 //  2. X-Session-ID header
-//  3. metadata.user_id (non-Claude Code format)
-//  4. conversation_id field
-//  5. Hash-based fallback from messages
+//  3. Session_id header (Codex)
+//  4. X-Amp-Thread-Id header (Amp CLI thread ID)
+//  5. X-Client-Request-Id header (PI)
+//  6. metadata.user_id (non-Claude Code format)
+//  7. conversation_id field in request body
+//  8. Stable hash from first few messages content (fallback)
 //
 // Note: The cache key includes provider, session ID, and model to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
@@ -577,9 +573,12 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 // Priority order:
 //  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority for Claude Code clients
 //  2. X-Session-ID header
-//  3. metadata.user_id (non-Claude Code format)
-//  4. conversation_id field in request body
-//  5. Stable hash from first few messages content (fallback)
+//  3. Session_id header (Codex)
+//  4. X-Amp-Thread-Id header (Amp CLI thread ID)
+//  5. X-Client-Request-Id header (PI)
+//  6. metadata.user_id (non-Claude Code format)
+//  7. conversation_id field in request body
+//  8. Stable hash from first few messages content (fallback)
 func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]any) string {
 	primary, _ := extractSessionIDs(headers, payload, metadata)
 	return primary
@@ -615,22 +614,43 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 		}
 	}
 
+	// 3. Session_id header (Codex)
+	if headers != nil {
+		if sid := headers.Get("Session_id"); sid != "" {
+			return "codex:" + sid, ""
+		}
+	}
+
+	// 4. X-Amp-Thread-Id header (Amp CLI thread ID)
+	if headers != nil {
+		if tid := headers.Get("X-Amp-Thread-Id"); tid != "" {
+			return "amp:" + tid, ""
+		}
+	}
+
+	// 5. X-Client-Request-Id header (PI)
+	if headers != nil {
+		if rid := headers.Get("X-Client-Request-Id"); rid != "" {
+			return "clientreq:" + rid, ""
+		}
+	}
+
 	if len(payload) == 0 {
 		return "", ""
 	}
 
-	// 3. metadata.user_id (non-Claude Code format)
+	// 6. metadata.user_id (non-Claude Code format)
 	userID := gjson.GetBytes(payload, "metadata.user_id").String()
 	if userID != "" {
 		return "user:" + userID, ""
 	}
 
-	// 4. conversation_id field
+	// 7. conversation_id field
 	if convID := gjson.GetBytes(payload, "conversation_id").String(); convID != "" {
 		return "conv:" + convID, ""
 	}
 
-	// 5. Hash-based fallback from message content
+	// 8. Hash-based fallback from message content
 	return extractMessageHashIDs(payload)
 }
 
